@@ -1,0 +1,251 @@
+import os
+import requests
+import gzip
+import shutil
+import numpy as np
+import pandas as pd
+from datetime import timedelta
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.metrics import mean_squared_error, mean_absolute_error
+import matplotlib.pyplot as plt
+
+
+
+#Q2 Function to convert Celsius to Fahrenheit
+def celsius_to_fahrenheit(celsius_temp):
+    """Convert Celsius to Fahrenheit."""
+    return (celsius_temp * 9 / 5) + 32
+
+
+# Function to convert UTC to EPT
+def convert_utc_to_ept(data):
+    """Convert 'utc_time' column to 'ept_time'."""
+    data['utc_time'] = pd.to_datetime(data[['Year', 'Month', 'Day', 'Hour']])
+    data['ept_time'] = data['utc_time'] - pd.to_timedelta(4, unit='h')  # Subtract 4 hours for EPT
+    return data
+
+
+# Function to download and extract .gz files
+def download_and_extract_file(url, output_dir):
+    """Download and extract the .gz file from the given URL."""
+    file_name = url.split("/")[-1]
+    gz_file_path = os.path.join(output_dir, file_name)
+
+    # Download the file
+    print(f"Downloading {file_name}...")
+    response = requests.get(url, stream=True)
+    if response.status_code == 200:
+        with open(gz_file_path, 'wb') as f:
+            f.write(response.content)
+        print(f"Downloaded {file_name}.")
+    else:
+        print(f"Failed to download {file_name}.")
+        return None
+
+    # Extract the .gz file
+    extracted_file_path = gz_file_path.replace('.gz', '')
+    print(f"Extracting {file_name}...")
+    with gzip.open(gz_file_path, 'rb') as f_in:
+        with open(extracted_file_path, 'wb') as f_out:
+            shutil.copyfileobj(f_in, f_out)
+    print(f"Extracted {file_name} to {extracted_file_path}.")
+
+    return extracted_file_path
+
+
+# Function to process the NOAA file
+def load_and_process_file(file_path):
+    """Process the extracted file and return a DataFrame."""
+    column_specifications = [
+        (0, 4), (5, 7), (8, 10), (11, 13), (14, 19), (20, 25),
+        (26, 31), (32, 36), (37, 42), (43, 44), (45, 50), (51, 56)
+    ]
+    column_names = [
+        "Year", "Month", "Day", "Hour", "Air Temperature (C)", "Dew Point Temperature (C)",
+        "Sea Level Pressure (hPa)", "Wind Direction (Degrees)", "Wind Speed (m/s)",
+        "Total Cloud Cover", "One-Hour Precipitation (mm)", "Six-Hour Precipitation (mm)"
+    ]
+
+    data = pd.read_fwf(file_path, colspecs=column_specifications, names=column_names)
+    data.replace([-9999, 9999], np.nan, inplace=True)  # Handle missing values
+    data["Air Temperature (C)"] = pd.to_numeric(data["Air Temperature (C)"], errors='coerce') / 10
+    data["Air Temperature (F)"] = celsius_to_fahrenheit(data["Air Temperature (C)"])
+    data = convert_utc_to_ept(data)
+
+    return data
+
+#Q1 Scrape hourly temperature data 
+# Function to scrape data from NOAA ISD Lite
+def scrape_noaa_data(start_year=2019, end_year=2023):
+    base_url = "https://www.ncei.noaa.gov/pub/data/noaa/isd-lite/{year}/725090-14739-{year}.gz"
+    output_dir = "./noaa_data"
+    os.makedirs(output_dir, exist_ok=True)
+    all_data = []
+
+    for year in range(start_year, end_year + 1):
+        url = base_url.format(year=year)
+        extracted_file_path = download_and_extract_file(url, output_dir)
+        if extracted_file_path:
+            data = load_and_process_file(extracted_file_path)
+            all_data.append(data)
+
+    combined_data = pd.concat(all_data, ignore_index=True)
+    print(combined_data)
+    return combined_data
+
+
+# Scrape NOAA data for 2019-2023
+all_data = scrape_noaa_data()
+
+
+#Q3 a) Function to count and interpolate missing temperature observations
+
+def count_and_interpolate_missing_temperatures(data):
+    """Counts missing hourly temperature observations and interpolates missing values."""
+    missing_data = data[data['Air Temperature (C)'].isna()]
+    missing_count = missing_data.shape[0]
+    if missing_count > 0:
+        print("Missing hourly temperature observations:")
+        print(missing_data[['Year', 'Month', 'Day', 'Hour', 'ept_time']])
+
+    data['Air Temperature (C)'] = data['Air Temperature (C)'].interpolate()
+    interpolated_rows = data.loc[data.index.isin(missing_data.index), ['Year', 'Month', 'Day', 'Hour', 'Air Temperature (C)']]
+    print("\nInterpolated values for missing observations:")
+    print(interpolated_rows)
+    data['Air Temperature (F)'] = celsius_to_fahrenheit(data['Air Temperature (C)'])
+
+    return missing_count, data
+
+
+# Count and interpolate missing temperature data
+missing_count, all_data = count_and_interpolate_missing_temperatures(all_data)
+print(f"Missing hourly temperature observations: {missing_count}")
+
+
+# Function to calculate gas day temperature
+def calculate_gas_day_temperature(data, year, month, day):
+    """Calculates the gas day temperature from 10AM EPT on the given day to 10AM EPT the next day."""
+    gas_day_start = pd.Timestamp(year=year, month=month, day=day, hour=10)
+    gas_day_end = gas_day_start + timedelta(hours=24)  # 24-hour gas day window
+    gas_day_data = data[(data['ept_time'] >= gas_day_start) & (data['ept_time'] < gas_day_end)]
+
+    if len(gas_day_data) != 24:
+        print(f"Warning: Incomplete data for the gas day ({len(gas_day_data)} hours found instead of 24).")
+
+    gas_day_temp_f = gas_day_data['Air Temperature (F)'].mean()
+    return gas_day_temp_f
+
+
+#Q3b) Function to calculate mean temperature for July 2021
+def calculate_mean_temperature_july_2021(data):
+    """Calculates the mean air temperature for July 2021."""
+    july_2021_data = data[(data['Year'] == 2021) & (data['Month'] == 7)]
+    mean_temperature = july_2021_data['Air Temperature (F)'].mean()
+    return mean_temperature
+
+
+#  Calculate mean air temperature for July 2021
+mean_temperature_july_2021 = calculate_mean_temperature_july_2021(all_data)
+print(f"Mean air temperature for July 2021: {mean_temperature_july_2021} °F")
+
+#Q4) Calculate gas day temperature for July 4th, 2020
+gas_day_temperature_july_4_2020 = calculate_gas_day_temperature(all_data, 2020, 7, 4)
+print(f"Gas day temperature for July 4th, 2020: {gas_day_temperature_july_4_2020:.2f} °F")
+
+# Save the temperature data to CSV
+all_data.to_csv('boston_temperature_data_2019_2023.csv', index=False)
+
+# Q5) Load the demand data from agt.xlsx
+demand_file_path = r'C:\Users\harish\Downloads\agt.xlsx'
+demand_data = pd.read_excel(demand_file_path)
+
+# Rename the columns for easier handling
+demand_data.columns = ['Date', 'Residential/Commercial', 'Power Plant']
+
+# Convert the Date column to datetime
+demand_data['Date'] = pd.to_datetime(demand_data['Date'])
+
+# Create the Total AGT Demand column (Residential/Commercial + Power Plant)
+demand_data['Total AGT Demand'] = demand_data['Residential/Commercial'] + demand_data['Power Plant']
+
+#  Load the temperature data from boston_temperature_data_2019_2023.csv
+temperature_file_path = 'boston_temperature_data_2019_2023.csv'
+temperature_data = pd.read_csv(temperature_file_path)
+
+#  Create a Date column from the Year, Month, and Day columns in the temperature data
+temperature_data['Date'] = pd.to_datetime(temperature_data[['Year', 'Month', 'Day']])
+
+#  Calculate daily average temperature (Gas Day Temperature) from the hourly data
+daily_temperature = temperature_data.groupby('Date')['Air Temperature (F)'].mean().reset_index()
+daily_temperature.columns = ['Date', 'Gas_Day_Temperature']
+ 	 	
+#  Merge the demand data with daily temperature data on the Date column
+merged_data = pd.merge(demand_data, daily_temperature, on='Date')
+
+# Feature Engineering: Add day of the week and month as additional features
+merged_data['Day_of_Week'] = merged_data['Date'].dt.dayofweek
+merged_data['Month'] = merged_data['Date'].dt.month
+
+# Define features (X) and the target variable (y)
+X = merged_data[['Gas_Day_Temperature', 'Day_of_Week', 'Month']]
+y = merged_data['Total AGT Demand']
+
+#Q6 Build a model to forecast Total AGT demand
+#Split the data into training and testing sets (2019-2021 for training, 2022 for testing)
+train_data = merged_data[merged_data['Date'] < '2022-01-01']
+test_data = merged_data[merged_data['Date'] >= '2022-01-01']
+
+X_train = train_data[['Gas_Day_Temperature', 'Day_of_Week', 'Month']]
+y_train = train_data['Total AGT Demand']
+X_test = test_data[['Gas_Day_Temperature', 'Day_of_Week', 'Month']]
+y_test = test_data['Total AGT Demand']
+
+# : Initialize the Random Forest Regression method
+rf_model = RandomForestRegressor(n_estimators=100, random_state=42)
+
+# Train the model on the training data
+rf_model.fit(X_train, y_train)
+
+#  Predict AGT demand for 2022
+y_pred = rf_model.predict(X_test)
+
+#6a)  Evaluate the model
+mse = mean_squared_error(y_test, y_pred)
+mae = mean_absolute_error(y_test, y_pred)
+print(f"Mean Squared Error (MSE): {mse}")
+print(f"Mean Absolute Error (MAE): {mae}")
+
+# Add the predictions to the test data
+test_data = test_data.copy()
+test_data['Predicted_AGT_Demand'] = y_pred
+
+# Print the first few rows of the test data with the predicted demand
+# print(test_data[['Date', 'Total AGT Demand', 'Predicted_AGT_Demand']])
+
+#  Save the results to a CSV file
+# test_data.to_csv('/Desktop/Assignment/agt_forecast_2022.csv', index=False)
+
+#Q6b) Plot 1: Daily 2022 forecast vs actual AGT total demand
+plt.figure(figsize=(10, 5))
+plt.plot(test_data['Date'], test_data['Total AGT Demand'], label='Actual Demand', marker='o')
+plt.plot(test_data['Date'], test_data['Predicted_AGT_Demand'], label='Predicted Demand', marker='x')
+plt.xlabel('Date')
+plt.ylabel('AGT Demand')
+plt.title('Daily 2022 Forecast vs Actual AGT Total Demand')
+plt.legend()
+plt.grid(True)
+plt.xticks(rotation=45)
+
+#Q6c) Plot 2: Daily 2022 forecast vs the gas day temperature
+plt.figure(figsize=(10, 5))
+plt.plot(test_data['Date'], test_data['Predicted_AGT_Demand'], label='Predicted Demand', marker='x')
+plt.plot(test_data['Date'], test_data['Gas_Day_Temperature'], label='Gas Day Temperature', marker='o')
+plt.xlabel('Date')
+plt.ylabel('AGT Demand / Gas Day Temperature')
+plt.title('Daily 2022 Forecast vs Gas Day Temperature')
+plt.legend()
+plt.grid(True)
+plt.xticks(rotation=45)
+
+# Show plots
+plt.show()
